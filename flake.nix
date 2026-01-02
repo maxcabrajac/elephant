@@ -35,17 +35,85 @@
         };
       });
 
-      packages = eachSystem (pkgs: {
+      packages = eachSystem (pkgs: let
+        version = lib.trim (builtins.readFile ./cmd/elephant/version.txt);
+        defaultGoArgs = {
+          inherit version;
+          src = ./.;
+          vendorHash = "sha256-XYGh4ZXRly3MCPWse51eUMyjXqtHzKbPEyD0J8S/MDk=";
+          # Share go modules between all builds
+          overrideModAttrs = _: _: {
+            name = "elephant-${version}-go-modules";
+          };
+
+          meta = with lib; {
+            homepage = "https://github.com/abenz1267/elephant";
+            license = licenses.gpl3Only;
+            platforms = platforms.linux;
+          };
+        };
+        buildGo = attrs: pkgs.buildGo125Module (lib.recursiveUpdate defaultGoArgs attrs);
+
+        buildProviders = providersPath: let
+          buildProvider = name: buildGo {
+            pname = "elephant-provider-${name}";
+
+            buildInputs = with pkgs; [
+              wayland
+            ];
+
+            nativeBuildInputs = with pkgs; [
+              protobuf
+              protoc-gen-go
+            ];
+
+            buildPhase = ''
+              runHook preBuild
+
+              echo "Building elephant provider: ${name}"
+              if ! go build -buildmode=plugin -o "${name}.so" ./${providersPath}/${name}; then
+                echo "⚠ Failed to build provider: ${name}.so"
+                exit 1
+              fi
+              echo "Built ${name}.so"
+
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+
+              mkdir -p $out/lib/elephant/providers
+              cp "${name}.so" "$out/lib/elephant/providers/"
+              echo "Installed provider: ${name}.so"
+
+              runHook postInstall
+            '';
+
+            meta.description = "Elephant ${name} provider";
+          };
+
+          dirHasGoFile = dir:
+              builtins.any
+                (lib.hasSuffix ".go")
+                (builtins.attrNames
+                  (builtins.readDir dir));
+
+          providerDirs =
+            lib.attrNames
+              (lib.filterAttrs (name: type: type == "directory" && dirHasGoFile (./. + "/${providersPath}/${name}"))
+                (builtins.readDir (./. + "/${providersPath}")));
+        in
+          lib.genAttrs'
+            providerDirs
+            (name: lib.nameValuePair "elephant-provider-${name}" (buildProvider name))
+         ;
+      in (buildProviders "internal/providers") // {
         default = self.packages.${pkgs.stdenv.system}.elephant-with-providers;
 
         # Main elephant binary
-        elephant = pkgs.buildGo125Module {
+        elephant = buildGo {
           pname = "elephant";
-          version = lib.trim (builtins.readFile ./cmd/elephant/version.txt);
-
-          src = ./.;
-
-          vendorHash = "sha256-XYGh4ZXRly3MCPWse51eUMyjXqtHzKbPEyD0J8S/MDk=";
 
           buildInputs = with pkgs; [
             protobuf
@@ -66,104 +134,14 @@
             	    --prefix PATH : ${lib.makeBinPath (with pkgs; [ fd ])}
           '';
 
-          meta = with lib; {
-            description = "Powerful data provider service and backend for building custom application launchers";
-            homepage = "https://github.com/abenz1267/elephant";
-            license = licenses.gpl3Only;
-            maintainers = [ ];
-            platforms = platforms.linux;
-          };
+          meta.description = "Powerful data provider service and backend for building custom application launchers";
         };
 
-        # Providers package - builds all providers with same Go toolchain
-        elephant-providers = pkgs.buildGo125Module rec {
+
+        elephant-providers = pkgs.symlinkJoin {
           pname = "elephant-providers";
-          version = lib.trim (builtins.readFile ./cmd/elephant/version.txt);
-
-          src = ./.;
-
-          vendorHash = "sha256-XYGh4ZXRly3MCPWse51eUMyjXqtHzKbPEyD0J8S/MDk=";
-
-          buildInputs = with pkgs; [
-            wayland
-          ];
-
-          nativeBuildInputs = with pkgs; [
-            protobuf
-            protoc-gen-go
-          ];
-
-          excludedProviders = [
-            "archlinuxpkgs"
-          ];
-
-          buildPhase = ''
-            runHook preBuild
-
-            echo "Building elephant providers..."
-
-            EXCLUDE_LIST="${lib.concatStringsSep " " excludedProviders}"
-
-            is_excluded() {
-              target="$1"
-              for e in $EXCLUDE_LIST; do
-                [ -z "$e" ] && continue
-                if [ "$e" = "$target" ]; then
-                  return 0
-                fi
-              done
-              return 1
-            }
-
-            if [ -d ./internal/providers ]; then
-              for dir in ./internal/providers/*; do
-                [ -d "$dir" ] || continue
-                provider=$(basename "$dir")
-                if is_excluded "$provider"; then
-                  echo "Skipping excluded provider: $provider"
-                  continue
-                fi
-                set -- "$dir"/*.go
-                if [ -e "$1" ]; then
-                  echo "Building provider: $provider"
-                  if ! go build -buildmode=plugin -o "$provider.so" ./internal/providers/"$provider"; then
-                    echo "⚠ Failed to build provider: $provider"
-                    exit 1
-                  fi
-                  echo "Built $provider.so"
-                else
-                  echo "Skipping $provider: no .go files found"
-                fi
-              done
-            else
-              echo "No providers directory found at ./internal/providers"
-            fi
-
-            runHook postBuild
-          '';
-
-          installPhase = ''
-            runHook preInstall
-
-            mkdir -p $out/lib/elephant/providers
-
-            # Copy all built .so files
-            for so_file in *.so; do
-              if [[ -f "$so_file" ]]; then
-                cp "$so_file" "$out/lib/elephant/providers/"
-                echo "Installed provider: $so_file"
-              fi
-            done
-
-            runHook postInstall
-          '';
-
-          meta = with lib; {
-            description = "Elephant providers (Go plugins)";
-            homepage = "https://github.com/abenz1267/elephant";
-            license = licenses.gpl3Only;
-            platforms = platforms.linux;
-          };
+          inherit version;
+          paths = lib.attrValues (lib.filterAttrs (name: _: lib.hasPrefix "elephant-provider-" name) self.packages.${pkgs.stdenv.system});
         };
 
         # Combined package with elephant + providers
